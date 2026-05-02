@@ -106,4 +106,3 @@ class ModelInference:
     def process_lpr(self,image):
         lpr_res = self.infer_lpr_model(image)
         return self.remove_dup(lpr_res)
-
