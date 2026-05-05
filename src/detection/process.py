@@ -8,6 +8,9 @@ from cfg.config import MODEL_PATH_LIST
 from .model_infer import ModelInference
 import cv2
 
+from src.detection.inference import InferenceRKNN
+from src.detection.tracker.bot_sort import BoTSORT
+
 class Detection:
     """
     doc
@@ -32,8 +35,32 @@ class Detection:
 
     def __init__(self, v_model_path: str = MODEL_PATH_LIST[0],
                  lpd_model_path: str = MODEL_PATH_LIST[1],
-                 lpr_model_path: str = MODEL_PATH_LIST[2]):
+                 lpr_model_path: str = MODEL_PATH_LIST[2]
+        ):
         self._model_inference = ModelInference(v_model_path, lpd_model_path, lpr_model_path)
+        self.car_det_model = InferenceRKNN(model_path=v_model_path,
+                                           img_size=(192, 320),
+                                           model_branch=3,
+                                           nms_thresh=0.6,
+                                           obj_thresh=0.5,
+                                           npu_core=0)
+        self.lpd_model = InferenceRKNN(model_path=lpd_model_path,
+                                      img_size=(160, 160),
+                                      model_branch=2,
+                                      nms_thresh=0.7,
+                                      obj_thresh=0.5,
+                                      npu_core=1)
+        self.lpr_model = InferenceRKNN(model_path=lpr_model_path,
+                                      img_size=(160, 160),
+                                      model_branch=2,
+                                      nms_thresh=0.7,
+                                      obj_thresh=0.5,
+                                      npu_core=1)
+        self.car_color_model = None
+        self.car_type_model = None
+
+        self.car_tracker = BoTSORT()
+
 
     def _extract_frame(self, frame, box: List[float]) -> Tuple:
         x1, y1, x2, y2 = map(int, box)
@@ -47,23 +74,22 @@ class Detection:
         """
         doc
         """
+
         detection_dict: Dict[int, Tuple] = OrderedDict()
-        min_v_size = 160 if fans else 300
-        # Vehicle detection
-        # t1 = time.time()
-        vp_ids, vp_boxes, vp_clss = self._model_inference.infer_vd_model(frame)
-        # print(f"frame {i}: {vp_ids}")
-        # print(f"\n*Vehicle detection time: {time.time()-t1:.3f}s")
-        if vp_ids.size==0:
+        min_v_size = 120 if fans else 160
+        v_boxex, v_clss, v_scores = self.car_det_model.end_to_end_inference(frame) # box shape x1 y1 x2 y2
+        v_ids = self.car_tracker.update(v_boxex, v_clss, v_scores)
+        if len(v_ids) == 0:
             return detection_dict
-        # if len(vp_ids)==0:
-        #     return detection_dict
-        for vp_id, box, vp_cls in zip(vp_ids, vp_boxes, vp_clss):
+
+        for car_id, box, v_cls in zip(v_ids, v_boxex, v_clss):
+
             vframe, box_cord = self._extract_frame(frame, box)
+
             det_stat = 1
-            if vp_cls == 3:
+            if v_cls == 3:
                 det_stat = 2
-                detection_dict[int(vp_id)] = [None, 0, box_cord, 0.0, det_stat, 0]
+                detection_dict[int(car_id)] = [None, 0, box_cord, 0.0, det_stat, 0]
                 # lp_boxes, _ = self._model_inference.infer_lpd_model(vframe)
                 # if lp_boxes.size>0:
                 #     det_stat = 2
@@ -75,26 +101,19 @@ class Detection:
  
             if vframe.shape[0] <= min_v_size or vframe.shape[1] <= min_v_size:
                 continue
-            # cv2.imwrite(f'nfv/frame{i}_{vp_id}.jpg', vframe)
-            # print(f"frame number: {i}")
-            # t1 = time.time()
-            lp_boxes = self._model_inference.infer_lpd_model(vframe)
-            # print(f"frame {i} lpbox: {lp_boxes}")
 
-            # print(f"\n**lp detection time: {time.time()-t1:.3f}s")
-            if lp_boxes.size == 0:
+            lp_boxes = self.lpd_model.end_to_end_inference(vframe)
+
+            if len(lp_boxes) == 0:
                 continue
 
             det_stat = 2
             lp_frame, _ = self._extract_frame(vframe, lp_boxes[0])
             if lp_frame.shape[0] <= 30 or lp_frame.shape[1] <= 75:
-                detection_dict[int(vp_id)] = [None, 0, box_cord, 0.0, det_stat, lp_frame.shape[1]]
+                detection_dict[int(car_id)] = [None, 0, box_cord, 0.0, det_stat, lp_frame.shape[1]]
                 continue
 
-            # License plate recognition
-            # t1 = time.time()
-            # cv2.imwrite(f'nflp/frame{i}_{vp_id}_lp.jpg', lp_frame)
-            lpchar_data, lp_char_num = self._model_inference.process_lpr(lp_frame)
+            lpchar_data, lp_char_num = self.lpr_model.end_to_end_inference(lp_frame)
             # print(f"\n***lp rec time: {time.time()-t1:.3f}s")
             if lpchar_data.size==0:
                 continue
@@ -119,4 +138,8 @@ class Detection:
 
         return detection_dict
 
+    def license_plate_prc(self, v_img):
+        pass
+
+    def color_type_prc(self, v_img):
 
