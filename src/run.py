@@ -3,10 +3,10 @@ doc
 """
 import os
 import time
-from threading import Thread, Event
+from threading import Thread, Event, Lock
 from datetime import datetime, timezone
 from typing import Dict, Tuple, List
-from copy import copy#, deepcopy
+from copy import copy, deepcopy
 from functools import wraps
 import cv2
 
@@ -17,7 +17,7 @@ from cfg.getSDcardAdd import findSDcardAdd
 from database.dbManager import DatabaseManager
 
 
-class RunWorker(Thread):
+class RunWorker():
     def __init__(self, frame_queue, processed_queue, killer, name = "RunWorker"):
         super().__init__(daemon=False, name=name)
         self.frame_queue = frame_queue
@@ -50,6 +50,11 @@ class RunWorker(Thread):
             if self.db_manager.get_last_id() else 0
 
         while not self.killer.is_stopped():
+
+
+
+
+
             # t1 = time.perf_counter()
             frame = self.frame_queue.get()
             if frame is object():

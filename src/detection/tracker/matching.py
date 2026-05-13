@@ -1,109 +1,117 @@
+from __future__ import annotations
+
 import numpy as np
+import scipy
+import lap
 
 
-def tlbr_iou(a, b):
-    """
-    a: (N,4) tlbr
-    b: (M,4) tlbr
-    returns IoU matrix (N,M)
-    """
-    if len(a) == 0 or len(b) == 0:
-        return np.zeros((len(a), len(b)), dtype=np.float32)
-
-    a = np.asarray(a, dtype=np.float32)
-    b = np.asarray(b, dtype=np.float32)
-
-    a_x1 = a[:, 0][:, None]
-    a_y1 = a[:, 1][:, None]
-    a_x2 = a[:, 2][:, None]
-    a_y2 = a[:, 3][:, None]
-
-    b_x1 = b[:, 0][None, :]
-    b_y1 = b[:, 1][None, :]
-    b_x2 = b[:, 2][None, :]
-    b_y2 = b[:, 3][None, :]
-
-    inter_x1 = np.maximum(a_x1, b_x1)
-    inter_y1 = np.maximum(a_y1, b_y1)
-    inter_x2 = np.minimum(a_x2, b_x2)
-    inter_y2 = np.minimum(a_y2, b_y2)
-
-    inter_w = np.maximum(0.0, inter_x2 - inter_x1)
-    inter_h = np.maximum(0.0, inter_y2 - inter_y1)
-    inter_area = inter_w * inter_h
-
-    area_a = np.maximum(0.0, a_x2 - a_x1) * np.maximum(0.0, a_y2 - a_y1)
-    area_b = np.maximum(0.0, b_x2 - b_x1) * np.maximum(0.0, b_y2 - b_y1)
-
-    union = area_a + area_b - inter_area
-    union = np.maximum(union, 1e-6)
-
-    return (inter_area / union).astype(np.float32)
-
-
-def iou_distance(tracks, detections, class_aware=False):
-    """
-    Cost = 1 - IoU
-    Lower is better.
-    """
-    if len(tracks) == 0 or len(detections) == 0:
-        return np.zeros((len(tracks), len(detections)), dtype=np.float32)
-
-    track_boxes = np.asarray([t.tlbr for t in tracks], dtype=np.float32)
-    det_boxes = np.asarray([d.tlbr for d in detections], dtype=np.float32)
-
-    ious = tlbr_iou(track_boxes, det_boxes)
-    cost = 1.0 - ious
-
-    if class_aware:
-        track_cls = np.asarray([t.cls for t in tracks], dtype=np.int32)
-        det_cls = np.asarray([d.cls for d in detections], dtype=np.int32)
-        mismatch = track_cls[:, None] != det_cls[None, :]
-        cost[mismatch] = 1e6
-
-    return cost.astype(np.float32)
-
-
-def greedy_match(cost_matrix, thresh):
-    """
-    Greedy minimum-cost bipartite matching.
+def bbox_ioa(box1: np.ndarray, box2: np.ndarray, iou: bool = False, eps: float = 1e-7) -> np.ndarray:
+    """Calculate the intersection over box2 area given box1 and box2.
 
     Args:
-        cost_matrix: shape (num_tracks, num_dets)
-        thresh: max acceptable cost
+        box1 (np.ndarray): A numpy array of shape (N, 4) representing N bounding boxes in x1y1x2y2 format.
+        box2 (np.ndarray): A numpy array of shape (M, 4) representing M bounding boxes in x1y1x2y2 format.
+        iou (bool, optional): Calculate the standard IoU if True else return inter_area/box2_area.
+        eps (float, optional): A small value to avoid division by zero.
 
     Returns:
-        matches: list of (row, col)
-        unmatched_rows: list[int]
-        unmatched_cols: list[int]
+        (np.ndarray): A numpy array of shape (N, M) representing the intersection over box2 area.
     """
-    num_rows, num_cols = cost_matrix.shape
+    # Get the coordinates of bounding boxes
+    b1_x1, b1_y1, b1_x2, b1_y2 = box1.T
+    b2_x1, b2_y1, b2_x2, b2_y2 = box2.T
 
-    if num_rows == 0 or num_cols == 0:
-        return [], list(range(num_rows)), list(range(num_cols))
+    # Intersection area
+    inter_area = (np.minimum(b1_x2[:, None], b2_x2) - np.maximum(b1_x1[:, None], b2_x1)).clip(0) * (
+        np.minimum(b1_y2[:, None], b2_y2) - np.maximum(b1_y1[:, None], b2_y1)
+    ).clip(0)
 
-    flat_order = np.argsort(cost_matrix, axis=None)
+    # Box2 area
+    area = (b2_x2 - b2_x1) * (b2_y2 - b2_y1)
+    if iou:
+        box1_area = (b1_x2 - b1_x1) * (b1_y2 - b1_y1)
+        area = area + box1_area[:, None] - inter_area
 
-    row_used = np.zeros(num_rows, dtype=bool)
-    col_used = np.zeros(num_cols, dtype=bool)
+    # Intersection over box2 area
+    return inter_area / (area + eps)
 
+
+def linear_assignment(cost_matrix: np.ndarray, thresh: float):
+    if cost_matrix.size == 0:
+        return (
+            np.empty((0, 2), dtype=np.int32),
+            np.arange(cost_matrix.shape[0], dtype=np.int32),
+            np.arange(cost_matrix.shape[1], dtype=np.int32),
+        )
+
+    cost_matrix = np.asarray(cost_matrix, dtype=np.float32)
     matches = []
+    _, x, y = lap.lapjv(cost_matrix, extend_cost=True, cost_limit=thresh)
 
-    for flat_idx in flat_order:
-        r = flat_idx // num_cols
-        c = flat_idx % num_cols
+    for ix, mx in enumerate(x):
+        if mx >= 0:
+            matches.append([ix, mx])
 
-        if row_used[r] or col_used[c]:
-            continue
+    matches = np.asarray(matches, dtype=np.int32) if matches else np.empty((0, 2), dtype=np.int32)
+    unmatched_a = np.where(x < 0)[0].astype(np.int32)
+    unmatched_b = np.where(y < 0)[0].astype(np.int32)
+    return matches, unmatched_a, unmatched_b
 
-        if cost_matrix[r, c] > thresh:
-            break
 
-        row_used[r] = True
-        col_used[c] = True
-        matches.append((r, c))
+def iou_distance(atracks, btracks) -> np.ndarray:
+    na, nb = len(atracks), len(btracks)
+    if na == 0 or nb == 0:
+        return np.zeros((na, nb), dtype=np.float32)
 
-    unmatched_rows = np.where(~row_used)[0].tolist()
-    unmatched_cols = np.where(~col_used)[0].tolist()
+    if isinstance(atracks[0], np.ndarray):
+        atlbrs = np.ascontiguousarray(atracks, dtype=np.float32)
+    else:
+        atlbrs = np.ascontiguousarray([track.xyxy for track in atracks], dtype=np.float32)
 
-    return matches, unmatched_rows, unmatched_cols
+    if isinstance(btracks[0], np.ndarray):
+        btlbrs = np.ascontiguousarray(btracks, dtype=np.float32)
+    else:
+        btlbrs = np.ascontiguousarray([track.xyxy for track in btracks], dtype=np.float32)
+
+    ious = bbox_ioa(atlbrs, btlbrs, iou=True).astype(np.float32, copy=False)
+    return 1.0 - ious
+
+
+def _xyxy_arrays(tracks_or_boxes):
+    if len(tracks_or_boxes) == 0:
+        return np.empty((0, 4), dtype=np.float32)
+
+    if isinstance(tracks_or_boxes[0], np.ndarray):
+        return np.ascontiguousarray(tracks_or_boxes, dtype=np.float32)
+
+    return np.ascontiguousarray([t.xyxy for t in tracks_or_boxes], dtype=np.float32)
+
+
+
+
+def embedding_distance(tracks, detections, metric: str = "cosine") -> np.ndarray:
+    cost_matrix = np.zeros((len(tracks), len(detections)), dtype=np.float32)
+    if cost_matrix.size == 0:
+        return cost_matrix
+
+    det_features = np.asarray([track.curr_feat for track in detections], dtype=np.float32)
+    track_features = np.asarray([track.smooth_feat for track in tracks], dtype=np.float32)
+
+    cost_matrix = np.maximum(
+        0.0,
+        scipy.spatial.distance.cdist(track_features, det_features, metric),
+    ).astype(np.float32, copy=False)
+
+    return cost_matrix
+
+
+def fuse_score(cost_matrix: np.ndarray, detections) -> np.ndarray:
+    if cost_matrix.size == 0:
+        return cost_matrix
+
+    iou_sim = 1.0 - cost_matrix
+    det_scores = np.asarray([det.score for det in detections], dtype=np.float32)
+    det_scores = np.expand_dims(det_scores, axis=0).repeat(cost_matrix.shape[0], axis=0)
+
+    fuse_sim = iou_sim * det_scores
+    return 1.0 - fuse_sim

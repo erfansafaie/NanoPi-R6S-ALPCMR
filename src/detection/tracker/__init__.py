@@ -1,3 +1,5 @@
-from .bot_sort import BoTSORT
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
-__all__ = ["BoTSORT"]
+from .bot_sort import BOTSORT
+
+__all__ = "BOTSORT"

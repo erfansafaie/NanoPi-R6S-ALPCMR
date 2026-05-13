@@ -8,7 +8,7 @@ def create_gst_pipeline(rtsp_src):
             rtspsrc location={rtsp_src} latency=0 drop-on-latency=true !
             rtph265depay ! h265parse ! mppvideodec fast-mode=true !
             queue max-size-buffers=1 leaky=downstream !
-            rgaconvert ! video/x-raw, format=BGR, width=4000, height=3000 ! appsink drop=1 max-buffers=1 sync=0
+            rgaconvert ! video/x-raw, format=BGR, width=2560, height=1440 ! appsink drop=1 max-buffers=1 sync=0
         """
 
 def camera(rtsp_address):
@@ -18,19 +18,18 @@ def camera(rtsp_address):
     
     try:
         while True:
-            ts = time.monotonic()
+            ts = time.perf_counter()
             ret, frame = cap.read()
             # print(ret)
             # print(frame.shape, frame.dtype)
-            # print(elps-ts)
+            print(time.perf_counter()-ts)
             # cv2.rectangle(frame, (100,100), (400,400), (0,255,0), 3)
-            frame = cv2.resize(frame, (1600,1200))
-            out.write(frame)
-            # cv2.imshow("online", frame)
-            elps = time.monotonic()
-            print(elps-ts)
-            # if cv2.waitKey(1) & 0xFF == 27:
-            #     break
+            # frame = cv2.resize(frame, (1600,1200))
+            # out.write(frame)
+            cv2.imshow("online", frame)
+            # elps = time.monotonic()
+            if cv2.waitKey(1) & 0xFF == 27:
+                break
 
     except:
         pass
@@ -52,4 +51,4 @@ def rec_vid():
 
 
 # camera("rtsp://admin:123456@192.168.168.52:554/stream1")
-camera("rtsp://admin:admin@192.168.1.238:554/stream1")
+camera("rtsp://admin:admin@192.168.168.52:554/stream1")

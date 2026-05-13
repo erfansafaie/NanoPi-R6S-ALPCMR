@@ -217,8 +217,9 @@ from threading import Thread, Lock
 
 import numpy as np
 import gi
-from gi.repository import Gst, GLib
 gi.require_version("Gst", "1.0")
+gi.require_version('GstApp', '1.0')
+from gi.repository import Gst, GLib, GstApp
 
 Gst.init(None)
 
@@ -231,8 +232,8 @@ class Camera:
     def __init__(
         self,
         rtsp_url: str,
-        width: int = 1920,
-        height: int = 1080,
+        width: int = 2560,
+        height: int = 1440,
         cam_id: int = 0,
         use_tcp: bool = True,
     ):
@@ -245,7 +246,7 @@ class Camera:
 
         # FPS tracking
         self._fps = 0
-        self._frame_count = 0
+        self._frame_counter = 0
         self._fps_start_time = time.perf_counter()
 
         # setup frame states
@@ -271,33 +272,20 @@ class Camera:
     def _build_pipeline(self) -> Gst.Pipeline:
         """
         rtspsrc (low latency)
-          → rtph265depay
-          → h265parse
-          → mppvideodec (hardware, fast-mode)
-          → NV12 (native format, keep it!)
-          → queue (minimal, leaky)
-          → appsink (drop old frames)
         """
         
         protocols = "tcp" if self.use_tcp else "udp"
         
         pipeline_str = (
-            f"rtspsrc location={self.rtsp_url} "
-            f"protocols={protocols} "
-            f"latency={0} "
-            f"drop-on-latency=true "
-            f"do-retransmission=false "
-            f"! rtph265depay "
-            f"! h265parse "
-            f"! mppvideodec fast-mode=true "  # Critical: fast-mode skips post-processing
-            f"! queue max-size-buffers=1 leaky=downstream"
-            f"! rgaconvert "
-            f"! video/x-raw,format=RGB,width={self.width},height={self.height} "
-            f"! appsink name=sink "
-            f"emit-signals=false "
-            f"max-buffers=1 "
-            f"drop=true "
-            f"sync=false"
+            f" rtspsrc location={self.rtsp_url} latency={0} drop-on-latency=true !"
+            f" rtph265depay !"
+            f" h265parse !"
+            f" mppvideodec fast-mode=true !"  # Critical: fast-mode skips post-processing
+            f" queue max-size-buffers=1 leaky=2 !"
+            f" rgaconvert !"
+            f" video/x-raw, format=RGB, width={self.width}, height={self.height} !"
+            f" appsink name=sink max-buffers=1 drop=true sync=false"
+            #f"emit-signals=false "
         )
         
         try:
@@ -325,9 +313,8 @@ class Camera:
             
             if sample is None:
                 continue
-            
             buffer = sample.get_buffer()
-            caps = sample.get_caps()
+            # caps = sample.get_caps()
             
             success, map_info = buffer.map(Gst.MapFlags.READ)
             if not success:
@@ -351,13 +338,14 @@ class Camera:
 
             # Update FPS counter
             self._frame_counter += 1
-            now = time.perf_counter()
-            elapsed = now - self._fps_time
+            # now = time.perf_counter()
+            # elapsed = now - self._f
+            
 
-            if elapsed >= 1.0:
-                self._fps = self._frame_counter / elapsed
-                self._frame_counter = 0
-                self._fps_time = now
+            # if elapsed >= 1.0:
+            #     self._fps = self._frame_counter / elapsed
+            #     self._frame_counter = 0
+            #     self._fps_start_time = now
 
         print(f"[Cam{self.cam_id}] Reader thread stopped")
 
@@ -448,7 +436,7 @@ class Camera:
             bool: True if ready, False otherwise
         """
         with self._lock:
-            return self._is_ready and self._latest_frame is not None
+            return self.is_ready and self._latest_frame is not None
 
     def get_info(self):
         """
