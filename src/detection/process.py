@@ -93,4 +93,5 @@ class Detection:
             (v_color, prob_v_color), (v_model, prob_v_model) = self._model_inference.color_type_prc()
                                                                     #TODO update the result queue
 
-    def aggregration_data
+    def aggregation_data(self):
+        pass
