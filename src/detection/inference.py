@@ -1,8 +1,11 @@
 
 import time
 from dataclasses import dataclass
-import cv2
+from threading import Lock
+
+from PIL import Image
 import numpy as np
+
 from rknnlite.api import RKNNLite
 
 
@@ -48,6 +51,9 @@ class InferenceDetRKNN:
         self.keep_multi_class = keep_multi_class
         self.pre_nms_topk = pre_nms_topk
 
+        self.lock = Lock()
+
+
         if max_det == 0:
             self.keep_multi_class = False
 
@@ -63,29 +69,31 @@ class InferenceDetRKNN:
         self.setup_rknn_model()
 
     def letter_box_preprc(self, img: np.ndarray, pad_color: tuple = (0, 0, 0)) -> np.ndarray:
-        h, w = img.shape[:2]
-        scale = min(self.img_size[0] / h, self.img_size[1] / w)
+
+        pil_img = Image.fromarray(img)
+        w, h = pil_img.size
+
+        target_h, target_w = self.img_size[0], self.img_size[1]
+        
+        scale = min(target_h / h, target_w / w)
 
         new_h = int(h * scale)
         new_w = int(w * scale)
 
-        resized_img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        resized_img = pil_img.resize((new_w, new_h), Image.Resampling.BILINEAR)
 
-        pad_h = (self.img_size[0] - new_h) // 2
-        pad_w = (self.img_size[1] - new_w) // 2
+        pad_h = (target_h - new_h) // 2
+        pad_w = (target_w - new_w) // 2
 
-        letterboxed_img = cv2.copyMakeBorder(
-            resized_img,
-            pad_h, self.img_size[0] - new_h - pad_h,
-            pad_w, self.img_size[1] - new_w - pad_w,
-            cv2.BORDER_CONSTANT,
-            value=pad_color,
-        )
+        letterboxed_pil = Image.new(pil_img.mode, (target_w, target_h), pad_color)
+        
+        letterboxed_pil.paste(resized_img, (pad_w, pad_h))
 
         self.letter_box_info = LetterBoxInfo(
             (h, w), self.img_size, scale, scale, pad_h, pad_w, pad_color
         )
-        # Expand dims without copy
+        
+        letterboxed_img = np.array(letterboxed_pil)
         return letterboxed_img[np.newaxis]
 
     def setup_rknn_model(self):
@@ -107,8 +115,12 @@ class InferenceDetRKNN:
     def filter_boxes(self, boxes, box_cls_probs):
         """Fused filter: scores = max class prob (conf is always 1.0 here)."""
         scores = box_cls_probs.max(axis=-1)
-        mask = scores >= self.obj_thresh
-        return boxes[mask], box_cls_probs[mask].argmax(axis=-1), scores[mask]
+        classes = box_cls_probs.argmax(axis=-1)
+        
+        # Keep boxes that pass the threshold AND are not class 3
+        mask = (scores >= self.obj_thresh) & (classes != 3)
+        
+        return boxes[mask], classes[mask], scores[mask]
 
     def nms_boxes(self, boxes, scores):
         """Standard greedy NMS."""
@@ -198,7 +210,6 @@ class InferenceDetRKNN:
         return self._grid_cache[key]
 
     def dfl(self, position):
-        """Optimized Distribution Focal Loss decode."""
         n, c, h, w = position.shape
         mc = c // 4
         y = position.reshape(n, 4, mc, h, w)
@@ -364,7 +375,7 @@ class InferenceDetRKNN:
         """End-to-end inference pipeline."""
 
         padded = self.letter_box_preprc(img)
-
+        # with self.lock:
         model_out = self.run(padded)
         boxes, clss, conf = self.post_process(model_out)
 
@@ -401,27 +412,35 @@ class InferenceClsRKNN:
             raise RuntimeError(f"Failed to init RKNN runtime: {ret}")
 
     def preprocess(self, img, pad_color=(0,0,0)):
-        h, w = img.shape[:2]
-        scale = min(self.img_size[0] / h, self.img_size[1] / w)
+        pil_img = Image.fromarray(img)
+        w, h = pil_img.size
+
+        target_h, target_w = self.img_size[0], self.img_size[1]
+        
+        scale = min(target_h / h, target_w / w)
 
         new_h = int(h * scale)
         new_w = int(w * scale)
 
-        resized_img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        resized_img = pil_img.resize((new_w, new_h), Image.Resampling.BILINEAR)
 
-        pad_h = (self.img_size[0] - new_h) // 2
-        pad_w = (self.img_size[1] - new_w) // 2
+        pad_h = (target_h - new_h) // 2
+        pad_w = (target_w - new_w) // 2
 
-        letterboxed_img = cv2.copyMakeBorder(
-            resized_img,
-            pad_h, self.img_size[0] - new_h - pad_h,
-            pad_w, self.img_size[1] - new_w - pad_w,
-            cv2.BORDER_CONSTANT,
-            value=pad_color,
+        letterboxed_pil = Image.new(pil_img.mode, (target_w, target_h), pad_color)
+        
+        letterboxed_pil.paste(resized_img, (pad_w, pad_h))
+
+        self.letter_box_info = LetterBoxInfo(
+            (h, w), self.img_size, scale, scale, pad_h, pad_w, pad_color
         )
+        
+        letterboxed_img = np.array(letterboxed_pil)
         return letterboxed_img[np.newaxis]
-    
+
     def run(self, img: np.ndarray):
         clss = self.rknn_model.inference([img])
         if clss[0].max() > self.cls_prob:
             return  clss[0].argmax(), float(clss[0].max())
+        else:
+            return None, 0.0

@@ -1,4 +1,6 @@
 from dataclasses import dataclass
+from types import SimpleNamespace
+
 import time
 
 import numpy as np
@@ -7,15 +9,23 @@ from src.detection.inference import InferenceDetRKNN, InferenceClsRKNN
 from src.detection.tracker.bot_sort import BOTSORT
 
 
-@dataclass
-class TrackerSet:
-    track_high_thresh: float = 0.4,
-    track_low_thresh: float = 0.2,
-    new_track_thresh: float = 0.4,
-    track_buffer: int = 15,
-    match_thresh: float = 0.8,
-    fuse_score: bool = True,
+# @dataclass
+# class TrackerSet:
+#     track_high_thresh: float = 0.4,
+#     track_low_thresh: float = 0.2,
+#     new_track_thresh: float = 0.4,
+#     track_buffer: int = 15,
+#     match_thresh: float = 0.8,
+#     fuse_score: bool = True
 
+args = SimpleNamespace(
+    track_high_thresh=0.6,
+    track_low_thresh=0.3,
+    new_track_thresh=0.4,
+    track_buffer=15,
+    match_thresh=0.7,
+    fuse_score=True,
+)
 
 class ModelInference:
     """
@@ -49,27 +59,36 @@ class ModelInference:
                     'Pride132', 'Pride141', 'Pride151', 'Quik', 'Renault_L90', 'Renault_Sandro',
                     'RenaultPK', 'RioSD', 'Runna', 'Saina', 'Samand', 'SamandSoren', 'Shahin',
                     'Tara', 'Tiba', 'Tiba2', 'Xantia')
-
+    TRACK_ARGS = SimpleNamespace(
+        track_high_thresh=0.6,
+        track_low_thresh=0.3,
+        new_track_thresh=0.4,
+        track_buffer=15,
+        match_thresh=0.7,
+        fuse_score=True,
+    )
     def __init__(
             self,
             v_model_path,
             lpd_model_path,
-            lpr_model_path
+            lpr_model_path,
+            color_model_path,
+            model_model_path
             ):
         """
         """
-        self._tracker_args = TrackerSet()
-        self._front_cam_tracker = BOTSORT(self.tracker_args)
-        self._rear_cam_tracker = BOTSORT(self.tracker_args)
+        self._tracker_args = self.TRACK_ARGS
+        self._front_cam_tracker = BOTSORT(self._tracker_args)
+        self._rear_cam_tracker = BOTSORT(self._tracker_args)
 
         self._vd_model = InferenceDetRKNN(
             model_path=v_model_path,
             img_size=(192,320),
             model_branch=3,
-            obj_thresh=0.4,
+            obj_thresh=0.45,
             nms_thresh=0.6,
             pre_nms_topk=100,
-            max_det=6,
+            max_det=4,
             keep_multi_class=False,
             reg_max=16,
             npu_core=0,
@@ -78,8 +97,8 @@ class ModelInference:
         self._lpd_model = InferenceDetRKNN(
             model_path=lpd_model_path,
             img_size=(160,160),
-            model_branch=2,
-            obj_thresh=0.4,
+            model_branch=1,
+            obj_thresh=0.5,
             nms_thresh=0.6,
             pre_nms_topk=16,
             max_det=1,
@@ -103,41 +122,42 @@ class ModelInference:
         )
 
         self._color_model = InferenceClsRKNN(
-            model_path="",
+            model_path=color_model_path,
             img_size=(128,128),
-            cls_prob=0.8,
+            cls_prob=0.5,
             npu_core=2
         )
         self._type_model = InferenceClsRKNN(
-            model_path="",
+            model_path=model_model_path,
             img_size=(128,128),
-            cls_prob=0.8,
+            cls_prob=0.5,
             npu_core=2
         )
 
-    def track_front_cam(self, image):
+    def track_front_cam(self, image: np.ndarray):
         boxes, clss, scores  = self._vd_model.end_to_end_inference(image)
-        return self._front_cam_tracker(boxes, clss, scores)
+        return self._front_cam_tracker.update(boxes, clss, scores)
 
-    def track_rear_cam(self, image):
+    def track_rear_cam(self, image: np.ndarray):
         boxes, clss, scores  = self._vd_model.end_to_end_inference(image)
-        return self._rear_cam_tracker(boxes, clss, scores)      
+        return self._rear_cam_tracker.update(boxes, clss, scores)      
 
     def infer_lpd_model(self, image):
         return self._lpd_model.end_to_end_inference(image)
 
     def infer_lpr_model(self, image):
-        boxes, clss, scores = self._lpd_model.end_to_end_inference(image)
+        boxes, clss, scores = self._lpr_model.end_to_end_inference(image)
         if boxes.size>0:
             order = boxes[:,0].argsort()
             return boxes[order], clss[order], scores[order]
         return boxes, clss, scores
 
     def remove_dup(
-            self, boxes: np.ndarray,
+            self,
+            boxes: np.ndarray,
             clss: np.ndarray,
             scores: np.ndarray,
-            x_pixel_thresh: float = 3.0,
+            x_pixel_thresh: float = 5.0,
             expected_chars: int = 8
         ):
         """
@@ -179,7 +199,7 @@ class ModelInference:
 
     def process_lpr(self,image):
         lpr_res_raw = self.infer_lpr_model(image)
-        lpr_res = self.remove_dup(lpr_res_raw)
+        lpr_res = self.remove_dup(lpr_res_raw[0], lpr_res_raw[1], lpr_res_raw[2])
         if (                    
             lpr_res[3] == 8 and 
             all(lpr_res[1][j] in self._SUB_CHAR_LABEL_NUM for j in (0, 1, 3, 4, 5, 6, 7)) and
@@ -187,12 +207,24 @@ class ModelInference:
         ):
             prob = round(sum(lpr_res[2])/8, 4)
             lp_text = [self._LABELS[int(lpr_res[1][i])] for i in range(8)]
-            return self.format_license_plate(lp_text), prob
+            return self.format_license_plate(lp_text), float(prob), lpr_res[3]
         else:
-            return None, 0.0
+            return None, 0.0, lpr_res[3]
     
-    def process_color_type(self, img: np.ndarray):
+    def process_color_model(self, img: np.ndarray):
         img = self._color_model.preprocess(img)
         v_color = self._color_model.run(img)
         v_model = self._type_model.run(img)
-        return self._COLOR_LABELS[v_color[0]], v_color[1], self._MODEL_LABELS[v_model[0]], v_model[1]
+        if v_color[1]>0:
+            color = self._COLOR_LABELS[v_color[0]]
+            color_prob = v_color[1]
+        else:
+            color = None
+            color_prob = 0.0
+        if v_model[1]>0:
+            model = self._MODEL_LABELS[v_model[0]]
+            model_prob = v_model[1]
+        else:
+            model = None
+            model_prob = 0.0
+        return color, color_prob, model, model_prob

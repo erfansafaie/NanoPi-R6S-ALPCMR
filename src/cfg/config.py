@@ -2,13 +2,13 @@
 
 
 
-vDetModel = "/home/pi/lp/lpMain/models/vd_640_v11_rknn_model"
+v_det_model = "/home/pi/NanoPi-R6S-ALPCMR/src/models/vd_640_v11.rknn"
+lpd_model = "/home/pi/NanoPi-R6S-ALPCMR/src/models/LPD_v4.0.0.rknn"
+lpr_model = "/home/pi/NanoPi-R6S-ALPCMR/src/models/LPR_160_v4.1.0.rknn"
+color_model = "/home/pi/NanoPi-R6S-ALPCMR/src/models/car_color_classification_128_13cls_v3.rknn"
+model_model = "/home/pi/NanoPi-R6S-ALPCMR/src/models/car_model_classification_128_47cls_v4.rknn"
 
-lpDModel = "/home/pi/lp/lpMain/models/LPD_v4.0.0_rknn_model"
-
-lpRModel = "/home/pi/lp/lpMain/models/LPR_160_v4.1.0_rknn_model"
-
-MODEL_PATH_LIST = [vDetModel, lpDModel, lpRModel]
+MODEL_PATH_LIST = [v_det_model, lpd_model, lpr_model, color_model, model_model]
 
 
 

@@ -307,7 +307,7 @@ def create_vid_gst_pipeline(vid_src):
         f"filesrc location={vid_src} ! "
         f"qtdemux ! h265parse ! mppvideodec ! rgaconvert ! "
         f"video/x-raw, format=BGR, width={WIDTH}, height={HEIGHT} ! "
-        f"appsink drop=true max-buffers=1 sync=false"
+        f"appsink drop=False max-buffers=30 sync=true"
     )
 
 
@@ -429,6 +429,7 @@ def capture_worker(cap):
 
         with frame_lock:
             latest_frame = frame
+        time.sleep(0.02)
 
 
 def inference_worker(vehicle_model, tracker, writer):
@@ -446,7 +447,7 @@ def inference_worker(vehicle_model, tracker, writer):
                 latest_frame = None
 
         if frame is None:
-            time.sleep(0.001)
+            time.sleep(0.01)
             continue
 
         t1 = time.perf_counter()
@@ -454,7 +455,7 @@ def inference_worker(vehicle_model, tracker, writer):
         boxes, clss, conf = vehicle_model.end_to_end_inference(frame)
         now = time.perf_counter()
         res = Results(boxes, conf, clss)
-        tracks = tracker.update(boxes, conf, clss)
+        tracks = tracker.update(boxes, clss, conf)
         fps = 1.0 / max(now - t1, 1e-6)
         infer_ms = (now - t1) * 1000.0
         annotated = frame.copy()

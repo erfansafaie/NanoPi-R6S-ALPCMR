@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from typing import Any
+from uuid import uuid4
 
 import numpy as np
 
@@ -18,9 +19,11 @@ class TrackState:
 
 class BaseTrack:
     _count = 0
+    _unique_id: str = None
 
     def __init__(self):
         self.track_id = 0
+        self.track_unique_id = ""
         self.is_activated = False
         self.state = TrackState.New
         self.history = OrderedDict()
@@ -39,7 +42,8 @@ class BaseTrack:
     @staticmethod
     def next_id() -> int:
         BaseTrack._count += 1
-        return BaseTrack._count
+        BaseTrack._unique_id = str(uuid4())
+        return BaseTrack._count, BaseTrack._unique_id
 
     def activate(self, *args: Any) -> None:
         raise NotImplementedError
@@ -107,7 +111,7 @@ class STrack(BaseTrack):
 
     def activate(self, kalman_filter: KalmanFilterXYWH, frame_id: int) -> None:
         self.kalman_filter = kalman_filter
-        self.track_id = self.next_id()
+        self.track_id, self.track_unique_id = self.next_id()
         self.mean, self.covariance = self.kalman_filter.initiate(self.tlbr_to_xywh(self._tlbr))
 
         self.tracklet_len = 0
@@ -128,7 +132,7 @@ class STrack(BaseTrack):
         self.frame_id = frame_id
 
         if new_id:
-            self.track_id = self.next_id()
+            self.track_id, self.track_unique_id = self.next_id()
 
         self.score = new_track.score
         self.cls = new_track.cls
@@ -172,7 +176,7 @@ class STrack(BaseTrack):
     @property
     def result(self) -> list[float]:
         coords = self.xyxy
-        return [*coords.tolist(), self.cls, self.score, self.track_id]
+        return [*coords.tolist(), self.cls, self.score, self.track_id, self.track_unique_id]
 
     @staticmethod
     def tlbr_to_xywh(tlbr: np.ndarray) -> np.ndarray:
@@ -223,11 +227,13 @@ class BOTSORT:
 
         self.frame_id = 0
         self.args = args
-        self.max_time_lost = int(frame_rate / 30.0 * args.track_buffer)
+        self.max_time_lost = int(frame_rate / 20 * args.track_buffer)
         self.kalman_filter = KalmanFilterXYWH()
         self.reset_id()
 
-    def update(self, bboxes, scores, cls) -> np.ndarray:
+        self.tracker_id_count = 0
+
+    def update(self, bboxes, cls, scores) -> np.ndarray:
         self.frame_id += 1
 
         activated_stracks = []
@@ -314,6 +320,9 @@ class BOTSORT:
             if track.score < self.args.new_track_thresh:
                 continue
             track.activate(self.kalman_filter, self.frame_id)
+            self.tracker_id_count += 1
+            track.track_id = self.tracker_id_count
+            track.track_unique_id = str(uuid4())
             activated_stracks.append(track)
 
         for track in self.lost_stracks:
@@ -337,7 +346,8 @@ class BOTSORT:
         if len(self.removed_stracks) > 1000:
             self.removed_stracks = self.removed_stracks[-1000:]
 
-        return np.asarray([x.result for x in self.tracked_stracks if x.is_activated], dtype=np.float32)
+        # return np.asarray([x.result for x in self.tracked_stracks if x.is_activated], dtype=np.float32)
+        return [x.result for x in self.tracked_stracks if x.is_activated]
 
     def init_track(self, dets, scores, cls) -> list[BOTrack]:
         if len(dets) == 0:
