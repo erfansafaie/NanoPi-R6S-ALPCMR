@@ -37,6 +37,7 @@ class DataSender:
             print(f"[DBWRITER] Using proxy for outbound HTTPS: {self.proxies['https']}")
         else:
             self.proxies = None
+        self._create_chekpoint_table()
 
 
     def _create_chekpoint_table(self):
