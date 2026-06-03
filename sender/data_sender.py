@@ -1,0 +1,324 @@
+import time
+import os
+import base64
+import socket
+import requests
+import sqlite3
+
+from pathlib import Path
+
+DATA_DB_PATH = ""
+CHECKPOINT_DB_PATH = ""
+
+
+class DataSender:
+
+    LP_GLOB_PATTERN  = '[0-9][0-9]_[A-Za-z]*[A-Za-z]_[0-9][0-9][0-9]_[0-9][0-9]'
+
+    def __init__(self):
+        self.data_db_conn = sqlite3.connect("DATA_DB_PATH")
+        self.checkpoint_db_conn = sqlite3.connect("CHECKPOINT_DB_PATH")
+
+        self.t_send_data = 30
+        self.t_now = time.time()
+        self.t_last = 0
+
+        self.IMAGE_DIR = "/home/pi/car-detector/public/detected/"
+        self.SERVER_URL = 'https://sit-optic-android-jetson.wingom.ir/upload'
+        self.CAM_ID = "CA_Mobile_Jetson"
+
+        https_proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+        http_proxy  = os.environ.get("HTTP_PROXY")  or os.environ.get("http_proxy")
+        if https_proxy or http_proxy:
+            self.proxies = {
+                "http":  http_proxy  or https_proxy,
+                "https": https_proxy or http_proxy,
+            }
+            print(f"[DBWRITER] Using proxy for outbound HTTPS: {self.proxies['https']}")
+        else:
+            self.proxies = None
+
+
+    def _create_chekpoint_table(self):
+        with self.checkpoint_db_conn:
+            self.checkpoint_db_conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sendChkpt (
+                row_id INTEGER PRIMARY KEY CHECK (row_id = 1),
+                last_timestamp TEXT NOT NULL DEFAULT '',
+                last_uuid TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+    
+    # TODO add more params reading from database
+    def read_next_batch(self, last_ts: str, last_uuid: str):
+
+        base_query = """
+            SELECT ID, timeStamp, color, model, licensePlate
+            FROM opendetData
+            WHERE licensePlate GLOB ?
+        """
+
+        params = [self.LP_GLOB_PATTERN]
+
+        if last_ts:
+            condition = """
+                AND ((timeStamp > ?) OR (timeStamp = ? AND ID > ?))
+            """
+            full_query = base_query + condition + """
+                ORDER BY timeStamp ASC, ID ASC
+                LIMIT ?
+            """
+            params.extend([last_ts, last_ts, last_uuid, self.BATCH_SIZE_DATA])
+        else:
+            full_query = base_query + """
+                ORDER BY timeStamp ASC, ID ASC
+                LIMIT ?
+            """
+            params.append(self.BATCH_SIZE_DATA)
+
+        return self.data_db_conn.execute(full_query, params).fetchall()
+
+
+    def check_network_connection(self) -> bool:
+        """
+        Verify we can reach the server. If a proxy is configured we test the
+        proxy itself (TCP connect to its host:port), otherwise we test a
+        direct TCP connect to the server on 443.
+        """
+        try:
+            if self.proxies:
+                # Parse "http://host:port" -> host, port
+                from urllib.parse import urlparse
+                p = urlparse(self.proxies["https"])
+                host = p.hostname or "127.0.0.1"
+                port = p.port or 8080
+                socket.create_connection((host, port), timeout=3)
+            else:
+                socket.create_connection(
+                    ("sit-optic-android-jetson.wingom.ir", 443), timeout=3
+                )
+            return True
+        except OSError:
+            return False
+
+    def image_to_base64(self, image_path: Path):
+        if image_path.is_file():
+            return base64.b64encode(image_path.read_bytes()).decode('utf-8')
+        return None
+
+    def _f(v):
+        try:
+            return float(v) if v is not None else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+
+    def send_data(self):
+        row_check_db = self.checkpoint_db_conn.execute(
+            "SELECT last_timestamp, last_uuid FROM sendChkpt WHERE row_id = 1"
+        ).fetchone()
+        last_ts, last_uuid = (
+            row_check_db[0] if row_check_db else '',
+            row_check_db[1] if row_check_db else ''
+        )
+        rows = self.read_next_batch(last_ts, last_uuid)
+        if not rows:
+            print("[SEND] No new records to send.")
+            return
+        print(f"[SEND] {len(rows)} records read from database. Preparing...")    
+
+        payload = []
+        payload_keys = []
+
+        for row in rows:
+            # New schema (9 cols). Fall back gracefully if older 5-col rows
+            # somehow appear.
+            if len(row) == 9:
+                (uuid_str, ts, color, model, lp,
+                 lp_prob, lp_chars_prob, color_prob, model_prob) = row
+            else:
+                uuid_str, ts, color, model, lp = row[:5]
+                lp_prob = lp_chars_prob = color_prob = model_prob = 0.0
+
+            if not color:
+                color = "unknown"
+            if not model:
+                model = "unknown"
+
+            lp_prob       = self._f(lp_prob)
+            lp_chars_prob = self._f(lp_chars_prob)
+            color_prob    = self._f(color_prob)
+            model_prob    = self._f(model_prob)
+
+            img_path = Path(self.IMAGE_DIR) / f"{uuid_str}.jpg"
+            b64 = self.image_to_base64(img_path)
+            if b64:
+                print(f"  [READ] Record ready to send -> ID: {uuid_str} | LP: {lp} "
+                      f"| Color: {color} | Model: {model}")
+                # NOTE: box / top_pred_models / top_pred_colours are NOT yet
+                # persisted in opendetData. We send sane defaults so the
+                # server's required-field validation passes. When/if those
+                # columns get added, just read & forward them here.
+                payload.append({
+                    "camera_id":        self.CAM_ID,
+                    "date":             ts,
+                    "car_color":        color,
+                    "car_model":        model,
+                    "LP":               lp,
+                    "image":            b64,
+                    "class_name":       "car",
+                    "box":              [0, 0, 0, 0],
+                    "score":            lp_prob,
+                    "model_pred_score": model_prob,
+                    "color_pred_score": color_prob,
+                    "lp_pred_score":    [lp_prob],
+                    "lp_detail_scores": [lp_chars_prob],
+                    "top_pred_models":  {model: model_prob} if model else {},
+                    "top_pred_colours": {color: color_prob} if color else {},
+                })
+                payload_keys.append((ts, uuid_str))
+            else:
+                print(f"  [SKIP] Image for ID: {uuid_str} not found, skipped.")
+        if not payload:
+            print("[SEND] No records with valid images found. Sending cancelled.")
+            # IMPORTANT: do NOT advance the checkpoint here. We never sent anything,
+            # so we leave it as-is and retry on the next tick.
+            return
+
+        BATCH_SIZE = 1
+        total = len(payload)
+        total_batches = (total + BATCH_SIZE - 1) // BATCH_SIZE
+        success_count = 0
+        fail_count = 0
+
+        last_sent_ts = last_ts
+        last_sent_uuid = last_uuid
+
+        print(f"[SEND] Total {total} records will be sent in {total_batches} batches of {BATCH_SIZE}.")
+        print(f"[SEND] Server URL: {self.SERVER_URL}")
+
+        for batch_idx in range(0, total, BATCH_SIZE):
+            batch = payload[batch_idx:batch_idx + BATCH_SIZE]
+            batch_keys = payload_keys[batch_idx:batch_idx + BATCH_SIZE]
+            current_batch_num = (batch_idx // BATCH_SIZE) + 1
+
+            print("=" * 70)
+            print(f"[BATCH {current_batch_num}/{total_batches}] Batch content (contains {len(batch)} records):")
+            print("=" * 70)
+            for idx, item in enumerate(batch, start=1):
+                preview = {k: (v[:60] + "...[TRUNCATED]" if k == "image" and v else v)
+                           for k, v in item.items()}
+                print(f"  Record {idx}/{len(batch)}:")
+                for key, value in preview.items():
+                    print(f"    {key}: {value}")
+                print("-" * 70)
+
+            try:
+                r = requests.post(
+                    self.SERVER_URL,
+                    json=batch,
+                    headers={'Content-Type': 'application/json'},
+                    timeout=10,
+                    proxies=self.proxies,
+                )
+                r.raise_for_status()
+                print(f"[BATCH {current_batch_num}/{total_batches}] Send successful! Response code: {r.status_code}")
+                success_count += len(batch)
+
+                # Advance our local "last successfully sent" marker AND persist
+                # the checkpoint right away. If the loop is interrupted, we
+                # won't re-send what we already pushed.
+                last_sent_ts, last_sent_uuid = batch_keys[-1]
+                with self.checkpoint_db_conn:
+                    self.checkpoint_db_conn.execute(
+                        """ UPDATE sendChkpt
+                            SET last_timestamp = ?, last_uuid = ?
+                            WHERE row_id = 1""",
+                            (last_sent_ts, last_sent_uuid))
+
+            except requests.HTTPError as e:
+                # Server actively rejected this batch. Distinguish:
+                # - 4xx (client error): payload is bad. Retrying won't help;
+                #   we MUST skip past this record or we'll be stuck forever.
+                # - 5xx (server error): transient. break and retry later.
+                status = e.response.status_code if e.response is not None else 0
+                body = ""
+                try:
+                    body = e.response.text[:1000] if e.response is not None else ""
+                except Exception:
+                    pass
+
+                print(f"[BATCH {current_batch_num}/{total_batches}] Send failed: {e}")
+                if body:
+                    print(f"  Server response body: {body}")
+
+                if 400 <= status < 500:
+                    # Permanent client error. Log the offending IDs, advance
+                    # the checkpoint past them, and continue with next batch.
+                    bad_ids = [k[1] for k in batch_keys]
+                    print(f"  [SKIP] Server rejected (HTTP {status}) record(s): {bad_ids}. "
+                          f"Advancing checkpoint past them.")
+                    fail_count += len(batch)
+                    last_sent_ts, last_sent_uuid = batch_keys[-1]
+                    with self.checkpoint_db_conn:
+                        self.checkpoint_db_conn.execute(
+                            """ UPDATE sendChkpt
+                                SET last_timestamp = ?, last_uuid = ?
+                                WHERE row_id = 1""",
+                                (last_sent_ts, last_sent_uuid))
+                    continue
+                else:
+                    # 5xx: server is sick. Stop now and try again next tick.
+                    print(f"  [STOP] Server error (HTTP {status}). Will retry next cycle.")
+                    fail_count += len(batch)
+                    break
+
+            except requests.RequestException as e:
+                # Network / timeout / connection error: not the data's fault.
+                # Stop to preserve ordering and retry on next cycle.
+                print(f"[BATCH {current_batch_num}/{total_batches}] Network/transport error: {e}")
+                fail_count += len(batch)
+                break
+
+        print("=" * 70)
+        print(f"[SEND] Final summary: success = {success_count} | failed = {fail_count} | total = {total}")
+        print("=" * 70)
+
+        if success_count > 0:
+            print(f"[SEND] Checkpoint updated to ts={last_sent_ts}, uuid={last_sent_uuid}")
+        else:
+            print("[SEND] No successful sends. Checkpoint unchanged.")
+
+
+    def run(self):
+        """Main DBWriter loop."""
+        # NOTE: DatabaseManager is created INSIDE this process so the sqlite3
+        # connection is owned by the correct OS process (sqlite connections
+        # cannot be shared across processes).
+        print("[DBWRITER] Process loop started.")
+        while True:
+            self.t_now = time.time()
+            if self.t_now - self.t_last > self.t_send_data:
+                self.t_last = self.t_now
+                if self.check_network_connection():
+                    try:
+                        self.send_data()
+                    except Exception as e:
+                        print(f"[DBWRITER] send_data error: {e}")
+                else:
+                    print("[DBWRITER] Network unreachable, skipping send.")
+                continue
+            else:
+                # Avoid spinning the CPU at 100%
+                time.sleep(0.05)
+
+if __name__ == "__main__":
+
+    data_sender = DataSender()
+    data_sender.run()
+
+
+
+
+ 
