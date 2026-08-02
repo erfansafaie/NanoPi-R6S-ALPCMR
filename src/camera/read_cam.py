@@ -235,7 +235,8 @@ Gst.init(None)
 
 class Camera:
     """
-    Hardware-accelerated RTSP H.265 capture for NanoPi R6S.
+    Hardware-accelerated RTSP H.265, local H.265 video, and USB MJPEG
+    capture for NanoPi R6S.
 
     Produces FramePacket objects into a latest-frame queue:
 
@@ -263,6 +264,7 @@ class Camera:
         use_tcp: bool = False,
         queue_drop_old: bool = True,
         pull_timeout_sec: float = 0.1,
+        fps: int = 30,
     ):
         
         self.frame_queue = frame_queue
@@ -276,10 +278,12 @@ class Camera:
         self.use_tcp = use_tcp
         self.queue_drop_old = queue_drop_old
         self.pull_timeout_sec = pull_timeout_sec
+        self.fps = fps
 
         self.pipeline: Optional[Gst.Pipeline] = None
         self.appsink = None
         self.bus = None
+        self._source_type = None
 
         self._reader_thread: Optional[Thread] = None
         self._running = False
@@ -293,6 +297,10 @@ class Camera:
     def check_source_type(self, src):
         if src.startswith("rtsp://"):
             return True, "cam"
+        elif src.startswith("/dev/video") or src.startswith("/dev/v4l/by-id/"):
+            return True, "usb"
+        elif src.startswith("v4l2://"):
+            return True, "usb"
         elif src.lower().endswith(("mp4", "avi", "mov", "mkv")):
             return True, "vid"
         else:
@@ -300,13 +308,20 @@ class Camera:
 
     def _build_pipeline(self):
         _,  src = self.check_source_type(self.src_address)
+        self._source_type = src
         if src == "cam":
             self.pipeline = self._build_cam_pipeline()
+        elif src == "usb":
+            self.pipeline = self._build_usb_pipeline()
+            print(
+                f"[Cam {self.cam_id}] Hardware-decoded USB source: "
+                f"{self.src_address}"
+            )
         elif src == "vid":
             self.pipeline = self._build_vid_pipeline()
-            print(f"[{src}] : source")
+            print(f"[Cam {self.cam_id}] Hardware-decoded video source: {self.src_address}")
         else:
-            raise ValueError(f"[Cam{self.cam_id}] Unknown source type: {self.src}")
+            raise ValueError(f"[Cam{self.cam_id}] Unknown source type: {self.src_address}")
 
         self.appsink = self.pipeline.get_by_name("sink")
         if self.appsink is None:
@@ -344,20 +359,69 @@ class Camera:
                 f"[Cam{self.cam_id}] Failed to create RTSP pipeline: {e}"
             )
 
-    def _build_vid_pipeline(self) -> Gst.Pipeline:
-        """
-        Local H.265 video file pipeline.
-        """
+    def _build_usb_pipeline(self) -> Gst.Pipeline:
+        """Low-latency UVC MJPEG pipeline using Rockchip MPP + RGA."""
+
+        device_path = self.src_address
+        if device_path.startswith("v4l2://"):
+            device_path = device_path[len("v4l2://"):]
+        escaped_device = device_path.replace("\\", "\\\\").replace('"', '\\"')
+
+        print(
+            f"[Cam {self.cam_id}] USB pipeline: device={device_path}, "
+            f"format=MJPEG, decoder=mppjpegdec, "
+            f"output={self.width}x{self.height}@{self.fps}"
+        )
 
         pipeline_str = (
-            f"filesrc location={self.src_address} ! "
-            f"qtdemux ! "
-            f"h265parse ! "
-            f"mppvideodec fast-mode=true ! "
-            #f"queue max-size-buffers=1 leaky=2 ! "
+            f'v4l2src device="{escaped_device}" io-mode=2 do-timestamp=true ! '
+            f"image/jpeg,width={self.width},height={self.height},"
+            f"framerate={self.fps}/1 ! "
+            f"jpegparse ! "
+            f"mppjpegdec ! "
+            f"queue max-size-buffers=1 leaky=2 ! "
             f"rgaconvert ! "
             f"video/x-raw,format=RGB,width={self.width},height={self.height} ! "
-            f"appsink name=sink max-buffers=30 drop=false sync=true emit-signals=false"
+            f"appsink name=sink max-buffers=1 drop=true "
+            f"sync=false emit-signals=false"
+        )
+
+        try:
+            return Gst.parse_launch(pipeline_str)
+        except GLib.Error as e:
+            raise RuntimeError(
+                f"[Cam{self.cam_id}] Failed to create USB pipeline: {e}"
+            )
+
+    def _build_vid_pipeline(self) -> Gst.Pipeline:
+        """
+        Hardware-accelerated local video pipeline.
+        """
+
+        # qtdemux only supports QuickTime/MP4 containers.  The temporary
+        # recording is Matroska (.mkv), so it must use matroskademux.
+        if self.src_address.lower().endswith(".mkv"):
+            demuxer = "matroskademux"
+        else:
+            demuxer = "qtdemux"
+
+        print(
+            f"[Cam {self.cam_id}] Video pipeline: "
+            f"demuxer={demuxer}, codec=H.265, decoder=mppvideodec"
+        )
+
+        escaped_path = self.src_address.replace("\\", "\\\\").replace('"', '\\"')
+        pipeline_str = (
+            f'filesrc location="{escaped_path}" ! '
+            f"{demuxer} name=demux "
+            f"demux.video_0 ! "
+            f"h265parse config-interval=-1 ! "
+            f"video/x-h265,stream-format=byte-stream,alignment=au ! "
+            f"mppvideodec ! "
+            f"rgaconvert ! "
+            f"video/x-raw,format=RGB,width={self.width},height={self.height} ! "
+            f"appsink name=sink max-buffers=1 drop=true wait-on-eos=false "
+            f"sync=true emit-signals=false"
         )
 
         try:
@@ -404,18 +468,24 @@ class Camera:
             return
 
         if self.queue_drop_old:
-            try:
-                if self.frame_queue.full():
-                    self.frame_queue.get_nowait()
-                    self.stream_queue.get_nowait()
-            except Empty:
-                pass
-
-            try:
-                self.frame_queue.put_nowait(frame_pack)
-                self.stream_queue.put_nowait(frame)
-            except Full:
-                pass
+            # The inference and browser queues have different consumers and
+            # different speeds. Keep each one current independently so a slow
+            # model cannot make the displayed video accumulate old frames.
+            for target_queue, item in (
+                (self.frame_queue, frame_pack),
+                (self.stream_queue, frame),
+            ):
+                try:
+                    target_queue.put_nowait(item)
+                except Full:
+                    try:
+                        target_queue.get_nowait()
+                    except Empty:
+                        pass
+                    try:
+                        target_queue.put_nowait(item)
+                    except Full:
+                        pass
 
         else:
             try:
@@ -432,6 +502,8 @@ class Camera:
 
         print(f"[Cam{self.cam_id}] Reader thread started")
         frame_id = 0
+        report_frame_count = 0
+        report_started_at = time.monotonic()
         gst_timeout_ns = int(self.pull_timeout_sec * Gst.SECOND)
         while not self.killer.is_stopped() and self._running:
 
@@ -444,6 +516,14 @@ class Camera:
                 continue
 
             if sample is None:
+                if self._source_type == "vid" and self.appsink.is_eos():
+                    print(f"[Cam {self.cam_id}] Video ended; restarting from beginning")
+                    self.pipeline.set_state(Gst.State.READY)
+                    self.pipeline.get_state(Gst.SECOND)
+                    ret = self.pipeline.set_state(Gst.State.PLAYING)
+                    if ret == Gst.StateChangeReturn.FAILURE:
+                        print(f"[Cam {self.cam_id}] Failed to restart video")
+                        time.sleep(0.5)
                 continue
 
             buffer = sample.get_buffer()
@@ -465,11 +545,29 @@ class Camera:
                 buffer.unmap(map_info)
             t_now = time.time()
             frame_id += 1
+            report_frame_count += 1
+            if frame_id == 1:
+                print(
+                    f"[Cam {self.cam_id}] First hardware-decoded frame: "
+                    f"{frame.shape[1]}x{frame.shape[0]}"
+                )
             frame_pack = (frame, self.cam_id, frame_id, t_now)
             self._push_latest(frame_pack, frame)
             self._ready = True
 
-            time.sleep(0.02)
+            report_elapsed = time.monotonic() - report_started_at
+            if report_elapsed >= 5.0:
+                print(
+                    f"[Cam {self.cam_id}] Decode FPS: "
+                    f"{report_frame_count / report_elapsed:.1f}"
+                )
+                report_frame_count = 0
+                report_started_at = time.monotonic()
+
+            # File playback already follows its timestamps because appsink has
+            # sync=true. An additional sleep here would make it visibly slow.
+            if self._source_type == "cam":
+                time.sleep(0.02)
 
 
         print(f"[Cam {self.cam_id}] Reader thread stopped")
@@ -551,35 +649,73 @@ class StreamWS:
             websocket_url: str,
             websocket_port: int,
             stream_queue: Queue,
+            scale: float = 0.33,
+            jpeg_quality: int = 50,
     ):
+        if scale <= 0:
+            raise ValueError("Web stream scale must be greater than zero")
+        if not 1 <= jpeg_quality <= 100:
+            raise ValueError("JPEG quality must be between 1 and 100")
+
         self.websocket_url = websocket_url
+        self.websocket_port = websocket_port
         self.stream_queue = stream_queue
         self.killer = killer
+        self.scale = float(scale)
+        self.jpeg_quality = int(jpeg_quality)
+        self._reported_frame_size = False
 
         self.server = WebsocketServer(websocket_url, port=websocket_port)
         self.ws_thread = Thread(target=self.server.run_forever, daemon=True)
         self.ws_thread.start()
 
+        print(
+            f"[WS:{self.websocket_port}] Output scale={self.scale:g}, "
+            f"JPEG quality={self.jpeg_quality}"
+        )
+
     def _resize_encode(self, image):
         """
         Resize and Encode to jpeg input image. Prepare image array to send base64 on web-scoket
         """
-#         _, ui_frame_encode = cv2.imencode(".jpg", ui_frame)#, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
-#         b64_frame = base64.b64encode(ui_frame_encode).decode("utf-8")
-        return base64.b64encode(
-            cv2.imencode(
+        if self.scale == 1.0:
+            web_frame = image
+        else:
+            web_frame = cv2.resize(
+                image,
+                None,
+                fx=self.scale,
+                fy=self.scale,
+                interpolation=cv2.INTER_LINEAR,
+            )
+
+        encoded_ok, encoded_frame = cv2.imencode(
             ".jpg",
-            cv2.cvtColor(
-            cv2.resize(image, None, fx=0.33, fy=0.33, interpolation=cv2.INTER_LINEAR),
-            cv2.COLOR_RGB2BGR),
-            [int(cv2.IMWRITE_JPEG_QUALITY), 50])[1]
-        ).decode("utf-8")
+            cv2.cvtColor(web_frame, cv2.COLOR_RGB2BGR),
+            [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality],
+        )
+        if not encoded_ok:
+            raise RuntimeError("Could not encode dashboard frame as JPEG")
+
+        if not self._reported_frame_size:
+            source_height, source_width = image.shape[:2]
+            output_height, output_width = web_frame.shape[:2]
+            print(
+                f"[WS:{self.websocket_port}] First dashboard frame: "
+                f"{source_width}x{source_height} -> "
+                f"{output_width}x{output_height}"
+            )
+            self._reported_frame_size = True
+
+        return base64.b64encode(encoded_frame).decode("utf-8")
 
     def run(self):
         send_thread = Thread(target=self._send_loop, daemon=True)
         send_thread.start()
 
     def _send_loop(self):
+        report_frame_count = 0
+        report_started_at = time.monotonic()
         while not self.killer.is_stopped():
             try:
                 frame = self.stream_queue.get(timeout=0.05)
@@ -587,7 +723,15 @@ class StreamWS:
                 continue
             b64_frame = self._resize_encode(frame)
             self.server.send_message_to_all(b64_frame)
-            time.sleep(0.033)
+            report_frame_count += 1
+            report_elapsed = time.monotonic() - report_started_at
+            if report_elapsed >= 5.0:
+                print(
+                    f"[WS:{self.websocket_port}] Sent FPS: "
+                    f"{report_frame_count / report_elapsed:.1f}"
+                )
+                report_frame_count = 0
+                report_started_at = time.monotonic()
         self.server.shutdown()
         self.ws_thread.join()
 # class SteramWS:

@@ -7,25 +7,26 @@ import sqlite3
 
 from pathlib import Path
 
-DATA_DB_PATH = ""
-CHECKPOINT_DB_PATH = ""
+DATA_DB_PATH = "/home/pi/car-detector/database/data.db"
+CHECKPOINT_DB_PATH = "/home/pi/car-detector/database/checkpoint.db"
 
 
 class DataSender:
 
-    LP_GLOB_PATTERN  = '[0-9][0-9]_[A-Za-z]*[A-Za-z]_[0-9][0-9][0-9]_[0-9][0-9]'
+    LP_GLOB_PATTERN  = '[0-9][0-9]_[A-Za-z]*_[0-9][0-9][0-9]_[0-9][0-9]'
 
     def __init__(self):
-        self.data_db_conn = sqlite3.connect("DATA_DB_PATH")
-        self.checkpoint_db_conn = sqlite3.connect("CHECKPOINT_DB_PATH")
+        self.data_db_conn = sqlite3.connect(DATA_DB_PATH)
+        self.checkpoint_db_conn = sqlite3.connect(CHECKPOINT_DB_PATH)
 
         self.t_send_data = 30
+        self.BATCH_SIZE_DATA = 20
         self.t_now = time.time()
         self.t_last = 0
 
         self.IMAGE_DIR = "/home/pi/car-detector/public/detected/"
         self.SERVER_URL = 'https://sit-optic-android-jetson.wingom.ir/upload'
-        self.CAM_ID = "CA_Mobile_Jetson"
+        self.CAM_ID = "CAدوربین نانوپای"
 
         https_proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
         http_proxy  = os.environ.get("HTTP_PROXY")  or os.environ.get("http_proxy")
@@ -51,12 +52,15 @@ class DataSender:
             )
             """
         )
+            self.checkpoint_db_conn.execute(
+                "INSERT OR IGNORE INTO sendChkpt (row_id) VALUES (1)"
+            )
     
     # TODO add more params reading from database
     def read_next_batch(self, last_ts: str, last_uuid: str):
 
         base_query = """
-            SELECT ID, timeStamp, color, model, licensePlate
+            SELECT ID, timeStamp, color, model, licensePlate, prob, prob, colorProb, modelProb
             FROM opendetData
             WHERE licensePlate GLOB ?
         """
@@ -83,14 +87,8 @@ class DataSender:
 
 
     def check_network_connection(self) -> bool:
-        """
-        Verify we can reach the server. If a proxy is configured we test the
-        proxy itself (TCP connect to its host:port), otherwise we test a
-        direct TCP connect to the server on 443.
-        """
         try:
             if self.proxies:
-                # Parse "http://host:port" -> host, port
                 from urllib.parse import urlparse
                 p = urlparse(self.proxies["https"])
                 host = p.hostname or "127.0.0.1"
@@ -109,6 +107,7 @@ class DataSender:
             return base64.b64encode(image_path.read_bytes()).decode('utf-8')
         return None
 
+    @staticmethod
     def _f(v):
         try:
             return float(v) if v is not None else 0.0
@@ -127,14 +126,12 @@ class DataSender:
         if not rows:
             print("[SEND] No new records to send.")
             return
-        print(f"[SEND] {len(rows)} records read from database. Preparing...")    
+        print(f"[SEND] {len(rows)} records read from database. Preparing...")
 
         payload = []
         payload_keys = []
 
         for row in rows:
-            # New schema (9 cols). Fall back gracefully if older 5-col rows
-            # somehow appear.
             if len(row) == 9:
                 (uuid_str, ts, color, model, lp,
                  lp_prob, lp_chars_prob, color_prob, model_prob) = row
@@ -157,10 +154,6 @@ class DataSender:
             if b64:
                 print(f"  [READ] Record ready to send -> ID: {uuid_str} | LP: {lp} "
                       f"| Color: {color} | Model: {model}")
-                # NOTE: box / top_pred_models / top_pred_colours are NOT yet
-                # persisted in opendetData. We send sane defaults so the
-                # server's required-field validation passes. When/if those
-                # columns get added, just read & forward them here.
                 payload.append({
                     "camera_id":        self.CAM_ID,
                     "date":             ts,
@@ -183,8 +176,6 @@ class DataSender:
                 print(f"  [SKIP] Image for ID: {uuid_str} not found, skipped.")
         if not payload:
             print("[SEND] No records with valid images found. Sending cancelled.")
-            # IMPORTANT: do NOT advance the checkpoint here. We never sent anything,
-            # so we leave it as-is and retry on the next tick.
             return
 
         BATCH_SIZE = 1
@@ -227,9 +218,6 @@ class DataSender:
                 print(f"[BATCH {current_batch_num}/{total_batches}] Send successful! Response code: {r.status_code}")
                 success_count += len(batch)
 
-                # Advance our local "last successfully sent" marker AND persist
-                # the checkpoint right away. If the loop is interrupted, we
-                # won't re-send what we already pushed.
                 last_sent_ts, last_sent_uuid = batch_keys[-1]
                 with self.checkpoint_db_conn:
                     self.checkpoint_db_conn.execute(
@@ -239,10 +227,6 @@ class DataSender:
                             (last_sent_ts, last_sent_uuid))
 
             except requests.HTTPError as e:
-                # Server actively rejected this batch. Distinguish:
-                # - 4xx (client error): payload is bad. Retrying won't help;
-                #   we MUST skip past this record or we'll be stuck forever.
-                # - 5xx (server error): transient. break and retry later.
                 status = e.response.status_code if e.response is not None else 0
                 body = ""
                 try:
@@ -254,11 +238,11 @@ class DataSender:
                 if body:
                     print(f"  Server response body: {body}")
 
-                if 400 <= status < 500:
-                    # Permanent client error. Log the offending IDs, advance
-                    # the checkpoint past them, and continue with next batch.
+                if status in (400, 422):
+                    # Genuine per-record validation error (bad payload). Retrying
+                    # won't help, so skip past this record to avoid getting stuck.
                     bad_ids = [k[1] for k in batch_keys]
-                    print(f"  [SKIP] Server rejected (HTTP {status}) record(s): {bad_ids}. "
+                    print(f"  [SKIP] Server rejected as invalid (HTTP {status}) record(s): {bad_ids}. "
                           f"Advancing checkpoint past them.")
                     fail_count += len(batch)
                     last_sent_ts, last_sent_uuid = batch_keys[-1]
@@ -270,14 +254,15 @@ class DataSender:
                                 (last_sent_ts, last_sent_uuid))
                     continue
                 else:
-                    # 5xx: server is sick. Stop now and try again next tick.
-                    print(f"  [STOP] Server error (HTTP {status}). Will retry next cycle.")
+                    # Auth / routing / rate-limit (401,403,404,429,...) or 5xx server
+                    # error: NOT the record's fault. Do NOT advance the checkpoint;
+                    # stop and retry next cycle so nothing is silently skipped.
+                    print(f"  [STOP] HTTP {status} (not a payload problem). "
+                          f"Checkpoint NOT advanced; will retry next cycle.")
                     fail_count += len(batch)
                     break
 
             except requests.RequestException as e:
-                # Network / timeout / connection error: not the data's fault.
-                # Stop to preserve ordering and retry on next cycle.
                 print(f"[BATCH {current_batch_num}/{total_batches}] Network/transport error: {e}")
                 fail_count += len(batch)
                 break
@@ -293,10 +278,6 @@ class DataSender:
 
 
     def run(self):
-        """Main DBWriter loop."""
-        # NOTE: DatabaseManager is created INSIDE this process so the sqlite3
-        # connection is owned by the correct OS process (sqlite connections
-        # cannot be shared across processes).
         print("[DBWRITER] Process loop started.")
         while True:
             self.t_now = time.time()
@@ -311,15 +292,9 @@ class DataSender:
                     print("[DBWRITER] Network unreachable, skipping send.")
                 continue
             else:
-                # Avoid spinning the CPU at 100%
                 time.sleep(0.05)
 
 if __name__ == "__main__":
 
     data_sender = DataSender()
     data_sender.run()
-
-
-
-
- 

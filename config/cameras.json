@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "cameras": {
+    "front": {
+      "interface": "eth1",
+      "camera_ip": "192.168.168.52",
+      "mac_address": "e8:b7:23:0e:36:a2",
+      "rtsp_port": 554,
+      "rtsp_path": "/stream1",
+      "discovered_at": "2026-07-25T11:41:06+00:00"
+    }
+  },
+  "updated_at": "2026-07-25T11:41:06+00:00"
+}
